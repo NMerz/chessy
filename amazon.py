@@ -3,6 +3,7 @@ import boto3
 from typing import Optional, Sequence
 from itertools import chain
 import re
+import os
 
 
 class MoveParts:
@@ -17,14 +18,14 @@ class MoveParts:
 
     def __init__(
         self,
-        piece: Optional[str],
-        source: Optional[str],
-        capture: Optional[str],
-        rank: Optional[str],
-        file: Optional[str],
-        check: Optional[str],
-        ks_castle: bool,
-        qs_castle: bool,
+        piece: Optional[str] = None,
+        source: Optional[str] = None,
+        capture: Optional[str] = None,
+        rank: Optional[str] = None,
+        file: Optional[str] = None,
+        check: Optional[str] = None,
+        ks_castle: bool = False,
+        qs_castle: bool = False,
     ):
         self.piece = piece
         if piece == "":
@@ -69,11 +70,13 @@ class MoveParts:
 
 
 def extract_groups(to_extract: str) -> Sequence[str]:
-    matches = re.compile(r"^([QRBKN])?([a-h]?)(x?)([a-h])([0-9])(\+?)$").match(
+    if len(to_extract.split(" ")) != 1:
+        return extract_groups(to_extract.split(" ")[-1])
+    matches = re.compile(r"^([QRBKN])?([a-h]?)(x?)([a-h])([0-9])(\+?)#?$").match(
         to_extract
     )
     if not matches:
-        matches = re.compile(r"^([QRBKN])?([a-h]?)(x?)([a-h])([0-9]?)(\+?)$").match(
+        matches = re.compile(r"^([QRBKN])?([a-h]?)(x?)([a-h])([0-9]?)(\+?)#?$").match(
             to_extract
         )
     if not matches:
@@ -133,6 +136,8 @@ def fix_ocr_raw(to_fix: str) -> Optional[str]:
             to_fix = set_pos(to_fix, col_index, "f")
         if to_fix[col_index] == "L":
             to_fix = set_pos(to_fix, col_index, "h")
+        if to_fix[col_index] == "(":
+            to_fix = set_pos(to_fix, col_index, "c")
         to_fix = set_pos(to_fix, col_index, to_fix[col_index].lower())
         row_index = col_index + 1
         if len(to_fix) > row_index:
@@ -142,6 +147,8 @@ def fix_ocr_raw(to_fix: str) -> Optional[str]:
                 to_fix = set_pos(to_fix, row_index, "6")
             if to_fix[row_index].lower() == "s":
                 to_fix = set_pos(to_fix, row_index, "5")
+            if to_fix[row_index].lower() == "y":
+                to_fix = set_pos(to_fix, row_index, "4")
             if to_fix[row_index].lower() == "z":
                 to_fix = set_pos(to_fix, col_index, "2")
 
@@ -151,20 +158,67 @@ def fix_ocr_raw(to_fix: str) -> Optional[str]:
         return None
 
 
-def extract_from_table(header_row, table_rows):
-    white_moves_seperate = []
-    black_moves_seperate = []
+def get_white_black_cols(header_row, table_rows):
     white_cols = []
     black_cols = []
     for col_index, col in enumerate(header_row):
+        if col == None:
+            continue
         col = col.replace("'", "")
-        if col.lower() == "white":
+        if "white" in col.lower():
             white_cols.append(col_index)
-            white_moves_seperate.append([])
-        if col.lower() == "black" or col.lower() == "blac":
+        if "blac" in col.lower():
             black_cols.append(col_index)
-            black_moves_seperate.append([])
 
+    if (
+        len(white_cols) == 0
+        and len(black_cols) == 0
+        and table_rows
+        and table_rows[0]
+        and len(table_rows[0]) == 6
+    ):
+        return get_white_black_cols(
+            header_row=[
+                "#",
+                "white",
+                "black",
+                "#",
+                "white",
+                "black",
+            ],  # guess the most common
+            table_rows=table_rows,
+        )
+    if (
+        len(white_cols) == 0
+        and len(black_cols) == 0
+        and table_rows
+        and table_rows[0]
+        and len(table_rows[0]) == 4
+    ):
+        return get_white_black_cols(
+            header_row=[
+                "white",
+                "black",
+                "white",
+                "black",
+            ],  # guess the most common
+            table_rows=table_rows,
+        )
+
+    return white_cols, black_cols
+
+
+def extract_from_table(header_row, table_rows):
+    white_moves_seperate = []
+    black_moves_seperate = []
+    if not table_rows or len(table_rows) == 0:
+        return []
+
+    white_cols, black_cols = get_white_black_cols(header_row, table_rows)
+    for white_col in white_cols:
+        white_moves_seperate.append([])
+    for black_col in black_cols:
+        black_moves_seperate.append([])
     # Print body rows
     print("Table body data:")
     print(table_rows)
@@ -206,10 +260,18 @@ def extract_from_table(header_row, table_rows):
     )
 
 
-def get_amazon():
-    client = boto3.client("textract")
-    with open("test_image", "rb") as image:
-        image_content = image.read()
+access_key = os.environ.get("AWS_ACCESS_KEY_ID")
+secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY")
+region = "us-east-1"
+
+
+def get_amazon(image_content: [bytes]):
+    client = boto3.client(
+        "textract",
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        region_name=region,
+    )
     results = client.analyze_document(
         Document={
             "Bytes": image_content,
@@ -220,36 +282,74 @@ def get_amazon():
     )
     blocks = results["Blocks"]
     blocks_by_ids = dict()
+    table_ids = []
     for block in blocks:
         blocks_by_ids[block["Id"]] = block
         if block["BlockType"] == "TABLE":
-            table_id = block["Id"]
+            table_ids.append(block["Id"])
 
-    header_row = []
-    rows = []
-    col_num = 0
+    final_header = []
+    sortable_rows = []
+    print("table ids:", table_ids)
+    for table_id in table_ids:
+        header_row = []
+        rows = []
+        col_num = 0
 
-    for cell_id in blocks_by_ids[table_id]["Relationships"][0]["Ids"]:
-        if "EntityTypes" in blocks_by_ids[cell_id].keys():
-            header_row.append(
-                blocks_by_ids[blocks_by_ids[cell_id]["Relationships"][0]["Ids"][0]][
-                    "Text"
-                ]
-            )
-        else:
-            if col_num == 0:
-                rows.append([])
-            if "Relationships" in blocks_by_ids[cell_id].keys():
-                cell_text = blocks_by_ids[
-                    blocks_by_ids[cell_id]["Relationships"][0]["Ids"][0]
-                ]["Text"]
+        for cell_id in blocks_by_ids[table_id]["Relationships"][0]["Ids"]:
+            print(blocks_by_ids[cell_id])
+            if "EntityTypes" in blocks_by_ids[cell_id].keys():
+                if "Relationships" in blocks_by_ids[cell_id].keys():
+                    cell_text = blocks_by_ids[
+                        blocks_by_ids[cell_id]["Relationships"][0]["Ids"][0]
+                    ]["Text"]
+                else:
+                    cell_text = None
+                header_row.append(cell_text)
             else:
-                cell_text = None
-            rows[-1].append(cell_text)
-            if len(header_row) == 0:
-                return list()
-            col_num = (col_num + 1) % len(header_row)
+                if "Relationships" in blocks_by_ids[cell_id].keys():
+                    cell_text = blocks_by_ids[
+                        blocks_by_ids[cell_id]["Relationships"][0]["Ids"][0]
+                    ]["Text"]
+                else:
+                    cell_text = None
+                print(cell_text)
+                if len(header_row) == 0:
+                    header_row.append(cell_text)
+                    continue
+                if col_num == 0:
+                    rows.append([])
+                rows[-1].append(cell_text)
+                col_num = (col_num + 1) % len(header_row)
+        is_relevant_table = False
+        print("header row:", header_row)
+        for col_index, col in enumerate(header_row):
+            if col == None:
+                continue
+            col = col.replace("'", "")
+            if (
+                col.lower() == "white"
+                or col.lower() == "black"
+                or col.lower() == "blac"
+            ):
+                is_relevant_table = True
+                break
+        if not is_relevant_table:
+            continue
+        final_header = header_row
+        sort_score = 0
+        for row in rows:
+            if len(row) == 0:
+                continue
+            if row[0] == None:
+                continue
+            sort_score += len(row[0])
+        sortable_rows.append((sort_score, rows))
+
+    final_rows = []
+    for _, rows in sorted(sortable_rows):
+        final_rows.extend(rows)
 
     print("Amazon raw")
-    print(rows)
-    return extract_from_table(header_row, rows)
+    print(final_rows)
+    return extract_from_table(header_row, final_rows)

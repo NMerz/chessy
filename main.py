@@ -11,6 +11,8 @@ import datetime
 import base64
 import json
 import re
+import statistics
+import itertools
 
 from amazon import (
     MoveParts,
@@ -18,7 +20,12 @@ from amazon import (
     fix_ocr_raw,
     extract_from_table,
     get_amazon,
+    get_white_black_cols,
 )
+
+from google.protobuf.json_format import MessageToDict
+
+local = False
 
 load_dotenv()
 
@@ -98,23 +105,30 @@ def encode_image(image_path):
         return base64.b64encode(image_file.read()).decode("utf-8")
 
 
-# Path to your image
 image_path = "test_image"
 
-# Getting the base64 string
-base64_image = encode_image(image_path)
-openai_raw = feed_to_openai(base64_image).turns
 
-openai_white_moves = []
-openai_black_moves = []
+def get_openai_moves(base64_image: str):
+    openai_raw = feed_to_openai(base64_image).turns
 
-for turn in openai_raw:
-    openai_white_moves.append(get_move_parts(turn.white))
-    openai_black_moves.append(get_move_parts(turn.black))
+    openai_white_moves = []
+    openai_black_moves = []
 
-print("OpenAI moves:")
-openai_moves = list(zip(openai_white_moves, openai_black_moves))
-print(openai_moves)
+    for turn in openai_raw:
+        openai_white_moves.append(get_move_parts(turn.white))
+        openai_black_moves.append(get_move_parts(turn.black))
+
+    print("OpenAI moves:")
+    openai_moves = list(zip(openai_white_moves, openai_black_moves))
+    return openai_moves
+    print(openai_moves)
+
+
+if local:
+    # Getting the base64 string
+    base64_image = encode_image(image_path)
+    openai_moves = get_openai_moves(base64_image)
+
 
 from google.api_core.client_options import ClientOptions
 from google.cloud import documentai  # type: ignore
@@ -144,8 +158,19 @@ def array_rows(
     for table_row in table_rows:
         row = []
         for cell in table_row.cells:
+            print(cell)
+            print(cell.layout.bounding_poly)
+            # print(MessageToDict(cell.layout.bounding_poly))
             cell_text = layout_to_text(cell.layout, text)
-            row.append(f"{repr(cell_text.strip())}")
+            vertices = []
+            for vertex in cell.layout.bounding_poly.vertices:
+                vertices.append({"x": vertex.x, "y": vertex.y})
+            row.append(
+                (
+                    f"{repr(cell_text.strip())}",
+                    vertices,
+                )
+            )
         out_table_rows.append(row)
 
     return out_table_rows
@@ -166,10 +191,10 @@ def print_table_rows(
 
 
 def google_ocr(
-    file_path: str,
+    image_content: [bytes],
 ):
     processor_display_name: str = (
-        "projects/424251658231/locations/us/processors/3f540b5a91f4d91e"
+        "projects/965053369291/locations/us/processors/c522227897ac7837"
     )
     # You must set the `api_endpoint`if you use a location other than "us".
     opts = ClientOptions(api_endpoint=f"us-documentai.googleapis.com")
@@ -178,25 +203,7 @@ def google_ocr(
 
     # The full resource name of the location, e.g.:
     # `projects/{project_id}/locations/{location}`
-    parent = client.common_location_path("424251658231", "us")
-
-    """
-        # Create a Processor
-        processor = client.create_processor(
-            parent=parent,
-            processor=documentai.Processor(
-                type_="OCR_PROCESSOR",  # Refer to https://cloud.google.com/document-ai/docs/create-processor for how to get available processor types
-                display_name=processor_display_name,
-            ),
-        )
-
-        # Print the processor information
-        print(f"Processor Name: {processor.name}")
-    """
-
-    # Read the file into memory
-    with open(file_path, "rb") as image:
-        image_content = image.read()
+    parent = client.common_location_path("965053369291", "us")
 
     # Load binary data
     raw_document = documentai.RawDocument(
@@ -236,26 +243,73 @@ def google_ocr(
             header_text = print_table_rows(table.header_rows, text)
             header_row = table.header_rows[:1]
             body_rows = table.body_rows
-            if not "white" in header_text.lower() or not "black" in header_text.lower():
-                header_row = None
-                header_text = print_table_rows(body_rows[:1], text)
-                if "white" in header_text.lower() and "black" in header_text.lower():
-                    header_row = body_rows[:1]
-                    print(header_text)
-                    body_rows = body_rows[1:]
+
+            row1_text = print_table_rows(body_rows[:1], text)
+            print(body_rows)
+            print(body_rows[0])
+            print(body_rows[0].cells[0])
+            if "white" in row1_text.lower() and "black" in row1_text.lower():
+                header_row = body_rows[:1]
+                print(row1_text)
+                body_rows = body_rows[1:]
+            elif (
+                not "white" in header_text.lower() or not "black" in header_text.lower()
+            ):
+                if body_rows[0] and len(body_rows[0].cells) == 6:
+                    header_row = [
+                        "#",
+                        "white",
+                        "black",
+                        "#",
+                        "white",
+                        "black",
+                    ]  # guess the most common
+                else:
+                    print("failed to find header")
+                    continue
             else:
                 print(header_text)
             table_rows = array_rows(body_rows, text)
-
+            table_rows = [
+                row
+                for row in table_rows
+                # if statistics.fmean([len(cell) for cell in row]) <= 6
+                if not ("white" in f"{row}".lower() and "black" in f"{row}".lower())
+            ]  # Avoid picking up a bottom row like ["'RESULT'", "'WHITE'", "'WON'", "'DRAW'", "'BLACK'", "'WON'"]
             header_row = array_rows(header_row, text)[0]
+            header_row = [cell[0] for cell in header_row]
             print(header_row)
+            cell_bounds = []
+            print("get_white_black_cols", get_white_black_cols(header_row, table_rows))
+            print("table rows", table_rows)
+            for white_col, black_col in zip(
+                *get_white_black_cols(header_row, table_rows)
+            ):
+                cell_bounds.extend(
+                    itertools.chain.from_iterable(
+                        [[row[white_col][1], row[black_col][1]] for row in table_rows]
+                    )
+                )
+            print("cell bounds", cell_bounds)
+            table_rows = [[cell[0] for cell in row] for row in table_rows]
 
-            return extract_from_table(header_row, table_rows)
+            return extract_from_table(header_row, table_rows), cell_bounds
+    return [], []
 
 
-google_moves = google_ocr(image_path)
-print("Google moves:")
-print(google_moves)
+if local:
+    image_raw = base64.b64decode(base64_image)
+    google_moves, cell_bounds = google_ocr(image_raw)
+    print("Google moves:")
+    print(google_moves)
+    print(
+        json.dumps(
+            {
+                "cell_bounds": cell_bounds,
+            },
+            cls=ChessEncoder,
+        )
+    )
 
 
 @app.route("/", methods=["POST"])
@@ -263,25 +317,96 @@ def render_dom():
     # print(request)
     # print(request.get_data())
     request_contents = request.get_data().decode("utf-8")
-    contents = feed_to_openai(request_contents)
-    print(contents.moves)
-    print(json.dumps(contents.turns, cls=ChessEncoder))
+    # contents = feed_to_openai(request_contents)
+    openai_moves = get_openai_moves(request_contents)
+    image_raw = base64.b64decode(request_contents)
+    google_moves, cell_bounds = google_ocr(image_raw)
+    max_move = len(openai_moves)
+    for num, google_move in enumerate(google_moves):
+        if google_move:
+            if num + 1 > max_move:
+                max_move += 1
+                openai_moves.append([None, None])
+    amazon_moves = get_amazon(image_raw)
+    for num, amazon_move in enumerate(amazon_moves):
+        if amazon_move:
+            if num + 1 > max_move:
+                max_move += 1
+                openai_moves.append([None, None])
+    print(
+        json.dumps(
+            {
+                "openai": openai_moves,
+                "google": google_moves,
+                "amazon": amazon_moves,
+                "cell_bounds": cell_bounds,
+            },
+            cls=ChessEncoder,
+        )
+    )
     return (
-        json.dumps(contents.turns, cls=ChessEncoder),
+        json.dumps(
+            {
+                "openai": openai_moves,
+                "google": google_moves,
+                "amazon": amazon_moves,
+                "cell_bounds": cell_bounds,
+            },
+            cls=ChessEncoder,
+        ),
         200,
     )
 
 
-amazon_white_moves = [None] * len(openai_moves)
-amazon_black_moves = [None] * len(openai_moves)
-amazon_black_moves[2] = MoveParts("B", None, None, "c", None, None, False, False)
-amazon_moves = get_amazon()  # list(zip(amazon_white_moves, amazon_black_moves))
-print(amazon_moves)
+if local:
+    amazon_moves = get_amazon(image_raw)
+    print(amazon_moves)
 
-print("ocr moves:")
-print(json.dumps(openai_moves, cls=ChessEncoder))
-print(json.dumps(google_moves, cls=ChessEncoder))
-print(json.dumps(amazon_moves, cls=ChessEncoder))
+    max_move = len(openai_moves)
+    for num, google_move in enumerate(google_moves):
+        if google_move and google_move != ["''", "''"] and google_move != (None, None):
+            if num + 1 > max_move:
+                print("g extending due to ", google_move)
+                max_move += 1
+                openai_moves.append([None, None])
+    for num, amazon_move in enumerate(amazon_moves):
+        if amazon_move and amazon_move != (None, None):
+            if num + 1 > max_move:
+                print("a extending due to ", amazon_move)
+                max_move += 1
+                openai_moves.append([None, None])
+    # print("ocr moves:")
+    # print(json.dumps(openai_moves, cls=ChessEncoder))
+    # print(json.dumps(google_moves, cls=ChessEncoder))
+    # print(json.dumps(amazon_moves, cls=ChessEncoder))
+    for turn_number, turn in enumerate(openai_moves):
+        if len(google_moves) > turn_number and google_moves[turn_number][0]:
+            google_move_white = google_moves[turn_number][0].to_play()
+        else:
+            google_move_white = ""
+        if len(amazon_moves) > turn_number and amazon_moves[turn_number][0]:
+            amazon_move_white = amazon_moves[turn_number][0].to_play()
+        else:
+            amazon_move_white = ""
+        if turn[0]:
+            openai_move_white = turn[0].to_play()
+        else:
+            openai_move_white = ""
+        if len(google_moves) > turn_number and google_moves[turn_number][1]:
+            google_move_black = google_moves[turn_number][1].to_play()
+        else:
+            google_move_black = ""
+        if len(amazon_moves) > turn_number and amazon_moves[turn_number][1]:
+            amazon_move_black = amazon_moves[turn_number][1].to_play()
+        else:
+            amazon_move_black = ""
+        if turn[1]:
+            openai_move_black = turn[1].to_play()
+        else:
+            openai_move_black = ""
+        print(
+            f"{turn_number + 1}:\n\tg ({google_move_white}) \t ({google_move_black})\n\ta ({amazon_move_white}) \t ({amazon_move_black}) \n\toa ({openai_move_white}) \t ({openai_move_black})\n\n"
+        )
 # arbitrate_moves(openai_moves, google_moves, amazon_moves)
 
 # if __name__ == "__main__":
