@@ -66,7 +66,7 @@ def feed_to_openai(image_base64: str) -> Any:
         messages=[
             {
                 "role": "system",
-                "content": f"transcribe the chess game",
+                "content": f"Transcribe Chess Game as PGN, but allow invalid moves",
             },
             {
                 "role": "user",
